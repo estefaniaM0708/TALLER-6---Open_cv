@@ -370,6 +370,14 @@ El sistema permite:
 
 ---
 
+## Evidencia
+
+La siguiente evidencia muestra el funcionamiento completo del sistema:
+
+[▶️ Video demostrativo Punto 6.1](evidencias/punto6_1.mp4)
+
+---
+
 # Conclusión
 
 El desarrollo permitió integrar una plataforma embebida basada en ESP32-S3 con un entorno de simulación robótica en Python.
