@@ -1,165 +1,154 @@
 # ================================================================
-# Actividad 6 - Punto 1  |  ESP32 + MicroPython (Thonny)
-# Teclado matricial 4x4 + LCD 16x2 I2C -> brazo dibujando en PyBullet
+# Actividad 6 - Punto 2  |  ESP-B  =  ESCLAVO SPI + OLED I2C  (MicroPython)
 #
-# Se escribe un número (hasta 4 cifras) en el teclado, se ve en el
-# LCD y al presionar '#' se envía por USB (UART) al PC. El script
-# "dibujar_brazo_teclado.py" hace que el brazo lo dibuje en una
-# pizarra y le devuelve el estado a la ESP32, que lo muestra en el LCD.
+# Recibe por SPI la trama de la ESP-A (maestro):
+#     [0xA5, digito, confianza, checksum, relleno]
+# verifica el checksum, contesta ACK/NAK por MISO en el 5.º byte y
+# muestra el dígito en grande en la pantalla OLED SSD1306 128x64.
 #
-#   Tecla   Acción
-#   0..9    agregar cifra (máx. 4)
-#   *       borrar la última cifra
-#   #       enviar -> el brazo dibuja el número        (NUM:123)
-#   A       repetir el último dibujo                   (CMD:A)
-#   B       borrar la pizarra                          (CMD:B)
-#   C       brazo a posición de reposo (home)          (CMD:C)
-#   D       limpiar lo escrito en el LCD (solo local)
+# MicroPython no trae modo esclavo SPI, así que aquí se implementa el
+# protocolo leyendo directamente las líneas del bus (modo 0):
+#   - CS en bajo  -> empieza la trama
+#   - flanco de subida de SCK -> se lee el bit de MOSI (MSB primero)
+#   - flanco de bajada de SCK -> se pone el siguiente bit en MISO
 #
 # Conexiones
-#   LCD I2C :  SDA -> GPIO21   SCL -> GPIO22   VCC -> 5V (VIN)   GND -> GND
-#   Teclado :  F1 F2 F3 F4 -> GPIO 13 14 27 26
-#              C1 C2 C3 C4 -> GPIO 25 33 32 23
-#   (el teclado usa las resistencias pull-up internas, no requiere externas)
+#   SPI (desde la ESP-A):  CS=GPIO5  SCK=GPIO18  MOSI=GPIO23  MISO=GPIO19  GND común
+#   OLED I2C:              SDA=GPIO21  SCL=GPIO22  VCC=3V3  GND=GND
 #
-# Guardar este archivo como main.py en la ESP32 junto con lcd_i2c.py
+# Guardar en la ESP-B:  main.py  y  ssd1306.py
 # ================================================================
 from machine import Pin, I2C
-import sys
-import select
+import framebuf
+import micropython
 import time
 
-from lcd_i2c import LCD
+from ssd1306 import SSD1306_I2C
 
-# ---------------- LCD ----------------
-# Si el LCD falla (mal conectado), el programa sigue funcionando sin él
-# para que el teclado y la comunicación con el PC se puedan probar igual.
-class _SinLCD:
-    def linea(self, fila, texto):
-        pass
+# ---------------- Pines SPI (ESP32-S3 esclavo) ----------------
+cs = Pin(10, Pin.IN, Pin.PULL_UP)
+sck = Pin(12, Pin.IN)
+mosi = Pin(11, Pin.IN)
+miso = Pin(13, Pin.OUT, value=0)
 
+INICIO, ACK, NAK, SIN_DIGITO = 0xA5, 0x06, 0x15, 0xFF
+LARGO_TRAMA = 5
+trama = bytearray(LARGO_TRAMA)
 
-try:
-    i2c = I2C(0, sda=Pin(21), scl=Pin(22), freq=100000)
-    print("I2C encontrado en:", [hex(d) for d in i2c.scan()])
-    lcd = LCD(i2c)
-except Exception as e:
-    print("AVISO: LCD no responde (revisa VCC=5V, GND, SDA=21, SCL=22):", e)
-    lcd = _SinLCD()
-
-led = Pin(2, Pin.OUT)      # LED azul de la placa: parpadea con cada tecla
-
-# ---------------- TECLADO 4x4 ----------------
-TECLAS = (
-    ("1", "2", "3", "A"),
-    ("4", "5", "6", "B"),
-    ("7", "8", "9", "C"),
-    ("*", "0", "#", "D"),
-)
-FILAS = [Pin(n, Pin.OUT, value=1) for n in (13, 14, 27, 26)]
-COLUMNAS = [Pin(n, Pin.IN, Pin.PULL_UP) for n in (25, 33, 32, 23)]
+# ---------------- OLED ----------------
+i2c = I2C(0, sda=Pin(8), scl=Pin(9), freq=400000)
+oled = SSD1306_I2C(128, 64, i2c)
+glifo = framebuf.FrameBuffer(bytearray(8), 8, 8, framebuf.MONO_VLSB)
 
 
-def escanear():
-    """Devuelve la tecla presionada o None. Pone una fila en 0 a la vez
-    y mira qué columna cae a 0."""
-    for f, fila in enumerate(FILAS):
-        fila.value(0)
-        time.sleep_us(5)
-        for c, col in enumerate(COLUMNAS):
-            if col.value() == 0:
-                fila.value(1)
-                return TECLAS[f][c]
-        fila.value(1)
-    return None
+def texto_grande(txt, x, y, escala):
+    """Escribe texto con la fuente 8x8 ampliada 'escala' veces."""
+    for k, ch in enumerate(txt):
+        glifo.fill(0)
+        glifo.text(ch, 0, 0, 1)
+        for py in range(8):
+            for px in range(8):
+                if glifo.pixel(px, py):
+                    oled.fill_rect(x + (k * 8 + px) * escala, y + py * escala,
+                                   escala, escala, 1)
 
 
-# ---------------- COMUNICACIÓN CON EL PC ----------------
-# Lo que la ESP32 imprime con print() viaja por el USB al PC.
-# Lo que el PC escribe en el puerto llega por sys.stdin.
-lector = select.poll()
-lector.register(sys.stdin, select.POLLIN)
-buffer_pc = ""
+# Dígitos grandes: fuente propia de 5x7 (más limpia que la 8x8 ampliada)
+FUENTE_5x7 = {
+    0: (".###.", "#...#", "#...#", "#...#", "#...#", "#...#", ".###."),
+    1: ("..#..", ".##..", "..#..", "..#..", "..#..", "..#..", ".###."),
+    2: (".###.", "#...#", "....#", "...#.", "..#..", ".#...", "#####"),
+    3: ("####.", "....#", "....#", ".###.", "....#", "....#", "####."),
+    4: ("...#.", "..##.", ".#.#.", "#..#.", "#####", "...#.", "...#."),
+    5: ("#####", "#....", "####.", "....#", "....#", "#...#", ".###."),
+    6: ("..##.", ".#...", "#....", "####.", "#...#", "#...#", ".###."),
+    7: ("#####", "....#", "...#.", "..#..", ".#...", ".#...", ".#..."),
+    8: (".###.", "#...#", "#...#", ".###.", "#...#", "#...#", ".###."),
+    9: (".###.", "#...#", "#...#", ".####", "....#", "...#.", ".##.."),
+}
 
 
-def leer_pc():
-    """Lee sin bloquear una línea enviada por el PC (o None)."""
-    global buffer_pc
-    while lector.poll(0):
-        ch = sys.stdin.read(1)
-        if ch in ("\n", "\r"):
-            if buffer_pc:
-                linea, buffer_pc = buffer_pc, ""
-                return linea
-        else:
-            buffer_pc += ch
-    return None
+def digito_grande(d, x, y, escala):
+    for fila, patron in enumerate(FUENTE_5x7[d]):
+        for col, ch in enumerate(patron):
+            if ch == "#":
+                oled.fill_rect(x + col * escala, y + fila * escala, escala, escala, 1)
 
 
-# ---------------- PROGRAMA PRINCIPAL ----------------
-MAX_CIFRAS = 4
-numero = ""
-ultima = None
-ANTIRREBOTE_MS = 30
+def encabezado():
+    oled.fill(0)
+    oled.fill_rect(0, 0, 128, 10, 1)
+    oled.text("ESCLAVO SPI", 20, 1, 0)
 
 
-def mostrar_numero():
-    lcd.linea(0, "Numero: " + numero + ("_" if len(numero) < MAX_CIFRAS else ""))
+def pantalla_espera():
+    encabezado()
+    oled.text("Esperando", 28, 26, 1)
+    oled.text("al maestro...", 12, 40, 1)
+    oled.show()
 
 
-def estado(texto):
-    lcd.linea(1, texto)
+def mostrar(digito, confianza, n):
+    encabezado()
+    if digito == SIN_DIGITO:
+        oled.text("Sin digito", 24, 26, 1)
+        oled.text("frente a la", 20, 38, 1)
+        oled.text("camara", 40, 50, 1)
+    else:
+        oled.rect(2, 13, 54, 50, 1)                 # marco del dígito
+        digito_grande(digito, 14, 17, 6)            # dígito de 30x42 píxeles
+        oled.text("CNN", 80, 16, 1)
+        conf = str(confianza) + "%"
+        texto_grande(conf, 64 + (64 - len(conf) * 16) // 2, 28, 2)
+        oled.text("#" + str(n), 76, 52, 1)
+    oled.show()
 
 
-mostrar_numero()
-estado("#=Dibujar *=Borr")
-print("ESP32 lista: teclado + LCD")
+# ---------------- Recepción SPI (esclavo por software) ----------------
+@micropython.native
+def recibir(buf):
+    """Recibe una trama mientras CS está en bajo. Devuelve los bytes recibidos."""
+    n = 0
+    while n < LARGO_TRAMA:
+        resp = 0
+        if n == LARGO_TRAMA - 1:               # 5.º byte: contestar por MISO
+            ok = buf[0] == INICIO and ((buf[0] ^ buf[1] ^ buf[2]) & 0xFF) == buf[3]
+            resp = ACK if ok else NAK
+        b = 0
+        for i in range(8):
+            miso.value((resp >> (7 - i)) & 1)  # bit para el maestro (antes de la subida)
+            while not sck.value():             # esperar flanco de subida
+                if cs.value():
+                    return n
+            b = (b << 1) | mosi.value()        # leer bit del maestro
+            while sck.value():                 # esperar flanco de bajada
+                if cs.value():
+                    return n
+        buf[n] = b
+        n += 1
+    return n
+
+
+pantalla_espera()
+print("ESP-B lista: esclavo SPI + OLED")
+recibidas = 0
+cs_anterior = 1
 
 while True:
-    tecla = escanear()
-
-    if tecla is not None and tecla != ultima:
-        time.sleep_ms(ANTIRREBOTE_MS)
-        if escanear() == tecla:                 # confirmada (antirrebote)
-            print("TECLA:" + tecla)             # diagnóstico (el PC la ignora)
-            led.value(1)
-            time.sleep_ms(40)
-            led.value(0)
-            if tecla.isdigit():
-                if len(numero) < MAX_CIFRAS:
-                    numero += tecla
-                    mostrar_numero()
-                else:
-                    estado("Max 4 cifras")
-            elif tecla == "*":
-                numero = numero[:-1]
-                mostrar_numero()
-            elif tecla == "#":
-                if numero:
-                    print("NUM:" + numero)      # -> PC
-                    estado("Enviado: " + numero)
-                    numero = ""
-                    mostrar_numero()
-                else:
-                    estado("Escribe un num.")
-            elif tecla == "A":
-                print("CMD:A")
-                estado("Repitiendo...")
-            elif tecla == "B":
-                print("CMD:B")
-                estado("Borrando pizarra")
-            elif tecla == "C":
-                print("CMD:C")
-                estado("Brazo a home")
-            elif tecla == "D":
-                numero = ""
-                mostrar_numero()
-                estado("#=Dibujar *=Borr")
-    ultima = tecla
-
-    # Mensajes del PC:  "LCD:texto"  -> segunda línea del LCD
-    msg = leer_pc()
-    if msg and msg.startswith("LCD:"):
-        estado(msg[4:])
-
-    time.sleep_ms(10)
+    cs_actual = cs.value()
+    if cs_anterior == 1 and cs_actual == 0:        # flanco de bajada de CS: inicia trama
+        n = recibir(trama)
+        miso.value(0)
+        while not cs.value():                      # esperar fin de la trama
+            pass
+        cs_actual = 1
+        ok = (n == LARGO_TRAMA and trama[0] == INICIO
+              and ((trama[0] ^ trama[1] ^ trama[2]) & 0xFF) == trama[3])
+        if ok:
+            recibidas += 1
+            d, c = trama[1], trama[2]
+            print("SPI recibido: digito", "-" if d == SIN_DIGITO else d, "conf", c, "%")
+            mostrar(d, c, recibidas)
+        else:
+            print("Trama con error:", n, "bytes", [hex(x) for x in trama])
+    cs_anterior = cs_actual
